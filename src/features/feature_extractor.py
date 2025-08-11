@@ -30,24 +30,36 @@ class FeatureExtractor:
         self.feature_extractor = self._create_feature_extractor()
     
     def _load_model(self) -> Model:
-        """Load the pre-trained model.
+        """Load the pre-trained model with memory optimizations.
         
         Returns:
             Loaded Keras model
         """
+        # Clear any existing TensorFlow/Keras session to free up memory
+        tf.keras.backend.clear_session()
+        
+        # Configure TensorFlow to use memory growth to prevent allocating all GPU memory at once
+        physical_devices = tf.config.list_physical_devices('GPU')
+        if physical_devices:
+            try:
+                for device in physical_devices:
+                    tf.config.experimental.set_memory_growth(device, True)
+            except RuntimeError as e:
+                print(f"Warning: Could not set memory growth: {e}")
+        
         if self.model_name == 'vgg16':
             # Load VGG16 without the top (fully connected) layers to save memory
-            base_model = VGG16(weights='imagenet', include_top=False, input_shape=self.input_shape)
-            # Add global average pooling to reduce the number of parameters
-            x = base_model.output
-            x = tf.keras.layers.GlobalAveragePooling2D()(x)
-            return Model(inputs=base_model.input, outputs=x)
+            with tf.device('/cpu:0'):  # Try loading on CPU first to save GPU memory
+                base_model = VGG16(weights='imagenet', include_top=False, 
+                                input_shape=self.input_shape, pooling='avg')
+            return Model(inputs=base_model.input, outputs=base_model.output)
             
         elif self.model_name == 'resnet50':
             # Load ResNet50 without the top (fully connected) layers
-            base_model = ResNet50(weights='imagenet', include_top=False, input_shape=self.input_shape)
-            # Use the existing average pooling layer
-            return Model(inputs=base_model.input, outputs=base_model.get_layer('avg_pool').output)
+            with tf.device('/cpu:0'):  # Try loading on CPU first to save GPU memory
+                base_model = ResNet50(weights='imagenet', include_top=False, 
+                                   input_shape=self.input_shape, pooling='avg')
+            return Model(inputs=base_model.input, outputs=base_model.output)
         else:
             raise ValueError(f"Unsupported model: {self.model_name}. Choose 'vgg16' or 'resnet50'.")
     
@@ -171,7 +183,7 @@ def get_feature_extractor(model_name: str = 'vgg16', input_shape: Tuple[int, int
 
 
 def extract_features_batch(images: List[np.ndarray], model_name: str = 'vgg16', 
-                         batch_size: int = 32) -> Dict[str, np.ndarray]:
+                         batch_size: int = 8) -> Dict[str, np.ndarray]:
     """Extract features from a batch of images.
     
     Args:
@@ -187,13 +199,29 @@ def extract_features_batch(images: List[np.ndarray], model_name: str = 'vgg16',
     # Initialize feature extractor
     extractor = FeatureExtractor(model_name=model_name)
     
-    # Extract CNN features
-    cnn_features = extractor.extract_batch_features(images, batch_size=batch_size)
-    
-    # Extract color histograms
-    color_hists = np.array([extractor.extract_color_histogram(img) for img in images])
-    
-    return {
-        'cnn_features': cnn_features,
-        'color_histograms': color_hists
-    }
+    try:
+        # Process the batch through the model
+        images_array = np.array(images)
+        cnn_features = extractor.model.predict(images_array, batch_size=batch_size, verbose=1)
+        
+        # Extract color histograms
+        color_hists = np.array([extractor.extract_color_histogram(img) for img in images])
+        
+        # Clear session and delete model to free up memory
+        del extractor
+        tf.keras.backend.clear_session()
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        return {
+            'cnn_features': cnn_features,
+            'color_histograms': color_hists
+        }
+    except Exception as e:
+        # Ensure we clean up even if there's an error
+        del extractor
+        tf.keras.backend.clear_session()
+        gc.collect()
+        raise e
